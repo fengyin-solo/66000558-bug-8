@@ -11,6 +11,7 @@ ACTIVE_CLIENTS = []
 SIM_RUNNING = True
 current_price = 100.0
 ticks_history = []
+main_loop = None
 
 class GridConfig(BaseModel):
     lowerPrice: float = 95
@@ -18,6 +19,27 @@ class GridConfig(BaseModel):
     gridCount: int = 20
     capitalPerGrid: float = 1000
     initialCapital: float = 100000
+
+
+def broadcast(payload: str):
+    """Send payload to every connected WS client; drop clients whose socket is dead."""
+    if main_loop is None:
+        return
+    dead = []
+    for ws in ACTIVE_CLIENTS:
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_text(payload), main_loop)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+
+
+def build_snapshot():
+    bids = [[round(current_price - 0.01 * i, 2), random.randint(100, 1000)] for i in range(1, 11)]
+    asks = [[round(current_price + 0.01 * i, 2), random.randint(100, 1000)] for i in range(1, 11)]
+    return {"ticks": ticks_history[-60:], "orderBook": {"bids": bids, "asks": asks, "midPrice": current_price, "spread": round(asks[0][0] - bids[0][0], 2)}}
 
 
 def simulate_market():
@@ -28,8 +50,10 @@ def simulate_market():
         price += random.gauss(drift, 0.3)
         price = max(80, min(130, price))
         current_price = price
+        now = time.time()
         tick = {
-            "time": time.strftime("%H:%M:%S"),
+            "ts": int(now * 1000),
+            "time": time.strftime("%H:%M:%S", time.localtime(now)),
             "price": round(price, 2),
             "bid": round(price - random.uniform(0.01, 0.05), 2),
             "ask": round(price + random.uniform(0.01, 0.05), 2),
@@ -39,21 +63,21 @@ def simulate_market():
         if len(ticks_history) > 200:
             ticks_history = ticks_history[-200:]
 
-        # Order book
-        bids = [[round(price - 0.01 * i, 2), random.randint(100, 1000)] for i in range(1, 11)]
-        asks = [[round(price + 0.01 * i, 2), random.randint(100, 1000)] for i in range(1, 11)]
-        order_book = {"bids": bids, "asks": asks, "midPrice": price, "spread": round(asks[0][0] - bids[0][0], 2)}
-
-        payload = json.dumps({"ticks": ticks_history[-60:], "orderBook": order_book})
-        for ws in ACTIVE_CLIENTS:
-            try: asyncio.run_coroutine_threadsafe(ws.send_text(payload), asyncio.get_event_loop())
-            except: pass
+        broadcast(json.dumps(build_snapshot()))
         time.sleep(0.5)
 
 
 @app.on_event("startup")
 async def startup():
+    global main_loop
+    main_loop = asyncio.get_running_loop()
     threading.Thread(target=simulate_market, daemon=True).start()
+
+
+@app.get("/api/ticks")
+def get_ticks():
+    """Latest market sequence, used for initial load and retries/reconnects."""
+    return {"ticks": ticks_history[-60:], "orderBook": build_snapshot()["orderBook"]}
 
 
 @app.post("/api/backtest")
@@ -137,7 +161,21 @@ def run_backtest(config: GridConfig):
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     ACTIVE_CLIENTS.append(ws)
+    # Push the current sequence immediately so a freshly (re)connected panel
+    # always renders against the same authoritative series.
     try:
-        while True: await ws.receive_text()
-    except: 
-        if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
+        await ws.send_text(json.dumps(build_snapshot()))
+    except Exception:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+        return
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
