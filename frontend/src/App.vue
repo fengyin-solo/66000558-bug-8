@@ -2,7 +2,7 @@
   <div class="app-root">
     <header class="top-bar">
       <h1>📈 实时订单簿深度可视化与量化网格交易引擎</h1>
-      <div class="status"><span class="dot" :class="{on:store.wsConnected}"></span>{{ store.wsConnected?'实时':'已断开' }}</div>
+      <div class="status"><span class="dot" :class="{on:store.wsConnected}"></span>{{ statusText }}</div>
     </header>
     <div class="main-grid">
       <div class="col-wide">
@@ -18,15 +18,30 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import OrderBookDepth from './components/OrderBookDepth.vue'
 import PriceChart from './components/PriceChart.vue'
 import GridControl from './components/GridControl.vue'
 import BacktestReport from './components/BacktestReport.vue'
 import { useTradingStore } from './store/trading'
 const store = useTradingStore()
-onMounted(() => store.connectWS())
-onUnmounted(() => store.disconnectWS())
+
+const statusText = computed(() => ({
+  connected: '实时', connecting: '连接中…', closed: '已断开', idle: '未连接'
+} as const)[store.connState])
+
+// 离开页面后中断或错过的行情不可信，返回页面时重新取数，曲线全部重算
+function onVisible() {
+  if (document.visibilityState === 'visible') store.connectWS()
+}
+onMounted(() => {
+  store.connectWS()
+  document.addEventListener('visibilitychange', onVisible)
+})
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', onVisible)
+  store.disconnectWS()
+})
 </script>
 
 <style>
